@@ -1,0 +1,11 @@
+{
+  "name": "kmail-proxy",
+  "private": true,
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^4.18.2"
+  }
+}
