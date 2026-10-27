@@ -70,111 +70,34 @@ async function upstream(path, { cookie, method = 'GET' } = {}) {
   }
 }
 
-// ---------- kmail serialized format decoder ----------
-// The `.data` endpoint returns a flat array like:
-//   [2,"routes/mail.$id","data",6,"email",8,"id","abc", ...]
-// where integer `_N` tokens are placeholders whose value is at index N.
-// Some entries are ["D", <int>] special markers.
-function decodeKmailPayload(arr) {
-  if (!Array.isArray(arr)) return arr;
+// Return just the two body fields from a kmail `.data` payload.
+// The payload is a flat stream: <keyToken> <valueToken> <keyToken> <valueToken> …
+// Values may be scalars (string/number/bool) OR an array (like ["D", 1793115241000]).
+// We walk the stream as tokens (not by i += 2) so arrays don't shift pairing.
+function extractBody(arr) {
+  if (!Array.isArray(arr)) return { textContent: '', htmlContent: '' };
 
-  // ---- 1. Build ref table ----
-  // The payload encodes references in two forms:
-  //   - bare numbers at even positions (implicit refs)
-  //   - objects like {"_5": 6} (named refs) which appear at both even and odd positions
-  const refs = new Map();
+  const WANT = new Set(['textContent', 'htmlContent']);
+  const out = { textContent: '', htmlContent: '' };
+
+  // The stream sometimes wraps keys in {"_N": "actualKey"} objects. In this
+  // payload those objects only appear at the front for routing metadata, so we
+  // simply look for the literal string keys "textContent"/"htmlContent" and
+  // take the immediately following element as the value.
   for (let i = 0; i < arr.length; i++) {
     const v = arr[i];
-    if (typeof v === 'number' && i % 2 === 0 && i + 1 < arr.length) {
-      // bare-token pair: arr[i] is token, arr[i+1] is the value
-      refs.set(v, arr[i + 1]);
-    } else if (v && typeof v === 'object' && !Array.isArray(v)) {
-      for (const [k, val] of Object.entries(v)) {
-        const m = /^_(\d+)$/.exec(k);
-        if (m) refs.set(Number(m[1]), val);
+    if (typeof v === 'string' && WANT.has(v)) {
+      const val = arr[i + 1];
+      if (typeof val === 'string') {
+        out[v] = val;
       }
+      i += 1; // consume the value so we don't re-match it
     }
   }
 
-  // ---- 2. Resolver ----
-  const seen = new Set();
-  function resolve(v, depth = 0) {
-    if (depth > 64) return v;
-    if (typeof v === 'number') {
-      if (seen.has(v) || !refs.has(v)) return v;
-      seen.add(v);
-      const out = resolve(refs.get(v), depth + 1);
-      seen.delete(v);
-      return out;
-    }
-    if (Array.isArray(v)) {
-      // ["D", <epochMs>] → ISO string
-      if (
-        v.length === 2 &&
-        typeof v[0] === 'string' &&
-        v[0].length === 1 &&
-        typeof v[1] === 'number'
-      ) {
-        if (v[0] === 'D') return new Date(v[1]).toISOString();
-        return v[1];
-      }
-      return v.map((x) => resolve(x, depth + 1));
-    }
-    if (v && typeof v === 'object') {
-      const out = {};
-      for (const [k, val] of Object.entries(v)) out[k] = resolve(val, depth + 1);
-      return out;
-    }
-    return v;
-  }
-
-  // ---- 3. Flatten the top-level pair list ----
-  // The top-level is [keyTokenOrRef, valueTokenOrRef, ...].
-  // Keys are usually strings ("id", "subject", …) or ref objects {"_N": v} whose
-  // value is a string. Resolve each key and only keep string keys.
-  const flat = {};
-  for (let i = 0; i < arr.length; i += 2) {
-    let key = resolve(arr[i]);
-    // Refs like {"_N": v} resolve to *string* keys when v is a string token
-    // already in refs. If the resolve returned an object, skip.
-    if (typeof key !== 'string') continue;
-    flat[key] = resolve(arr[i + 1]);
-  }
-
-  // ---- 4. Extract just the fields the client needs ----
-  // The `flat` output includes routing noise: "routes/mail.$id", "data", "email".
-  // The actual message object lives under `flat.email` in this payload, but we
-  // defensively fall back to `flat` itself if that shape changes.
-  const email =
-    (flat.email && typeof flat.email === 'object' && !Array.isArray(flat.email))
-      ? flat.email
-      : flat;
-
-  const pick = [
-    'id',
-    'mailboxId',
-    'messageId',
-    'fromAddress',
-    'toAddress',
-    'subject',
-    'textContent',
-    'htmlContent',
-    'rawEmail',
-    'receivedAt',
-    'isRead',
-    'size',
-    'attachments',
-  ];
-
-  const out = {};
-  for (const k of pick) if (email[k] !== undefined) out[k] = email[k];
-
-  // Normalize: strip trailing whitespace-only HTML, ensure attachments is [].
-  if (typeof out.htmlContent === 'string') {
-    out.htmlContent = out.htmlContent.trim();
-  }
-  if (!out.attachments) out.attachments = [];
-
+  // Normalize.
+  out.htmlContent = out.htmlContent.trim();
+  out.textContent = out.textContent.replace(/\r\n/g, '\n');
   return out;
 }
 
@@ -298,17 +221,10 @@ app.get('/api/mail/:id', async (req, res) => {
         .json({ error: `Upstream ${status}`, body: text.slice(0, 300) });
     }
 
-    let raw;
-    try {
-      raw = JSON.parse(text);
-    } catch {
-      return res
-        .status(502)
-        .json({ error: 'Upstream sent non-JSON', body: text.slice(0, 300) });
-    }
-
-    const decoded = decodeKmailPayload(raw);
-    return res.json(decoded);
+    const raw = JSON.parse(text);
+    const { textContent, htmlContent } = extractBody(raw);
+    return res.json({ textContent, htmlContent });
+    
   } catch (err) {
     if (err.name === 'AbortError')
       return res.status(504).json({ error: 'Upstream timed out' });
