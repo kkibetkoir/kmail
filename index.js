@@ -140,7 +140,7 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // Ask kmail for a fresh address. Returns { token, email, mails, stats }
 // `token` is what the client should send back on subsequent calls.
-app.post('/api/refresh', async (_req, res) => {
+app.get('/api/refresh', async (_req, res) => {
   try {
     const { status, text, setCookie } = await upstream('/api/refresh');
 
