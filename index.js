@@ -78,60 +78,104 @@ async function upstream(path, { cookie, method = 'GET' } = {}) {
 function decodeKmailPayload(arr) {
   if (!Array.isArray(arr)) return arr;
 
-  // Build lookup: token -> value (token is int at even index, value at odd index)
+  // ---- 1. Build ref table ----
+  // The payload encodes references in two forms:
+  //   - bare numbers at even positions (implicit refs)
+  //   - objects like {"_5": 6} (named refs) which appear at both even and odd positions
   const refs = new Map();
-  for (let i = 0; i < arr.length; i += 2) {
-    const token = arr[i];
-    const value = arr[i + 1];
-    if (typeof token === 'number') {
-      refs.set(token, value);
+  for (let i = 0; i < arr.length; i++) {
+    const v = arr[i];
+    if (typeof v === 'number' && i % 2 === 0 && i + 1 < arr.length) {
+      // bare-token pair: arr[i] is token, arr[i+1] is the value
+      refs.set(v, arr[i + 1]);
+    } else if (v && typeof v === 'object' && !Array.isArray(v)) {
+      for (const [k, val] of Object.entries(v)) {
+        const m = /^_(\d+)$/.exec(k);
+        if (m) refs.set(Number(m[1]), val);
+      }
     }
   }
 
-  // Resolve a value: if it's a number token, look it up recursively.
-  // Arrays of the form ["D", <int>] are special (Date); convert to something sane.
+  // ---- 2. Resolver ----
   const seen = new Set();
   function resolve(v, depth = 0) {
-    if (depth > 50) return v;
+    if (depth > 64) return v;
     if (typeof v === 'number') {
-      if (seen.has(v)) return v; // cycle guard
-      if (!refs.has(v)) return v;
+      if (seen.has(v) || !refs.has(v)) return v;
       seen.add(v);
-      const resolved = resolve(refs.get(v), depth + 1);
+      const out = resolve(refs.get(v), depth + 1);
       seen.delete(v);
-      return resolved;
+      return out;
     }
     if (Array.isArray(v)) {
-      // Special marker arrays like ["D", 1793109068000]
+      // ["D", <epochMs>] → ISO string
       if (
         v.length === 2 &&
         typeof v[0] === 'string' &&
-        typeof v[1] === 'number' &&
-        v[0].length === 1
+        v[0].length === 1 &&
+        typeof v[1] === 'number'
       ) {
         if (v[0] === 'D') return new Date(v[1]).toISOString();
         return v[1];
       }
-      return v.map((item) => resolve(item, depth + 1));
+      return v.map((x) => resolve(x, depth + 1));
     }
     if (v && typeof v === 'object') {
       const out = {};
-      for (const [k, val] of Object.entries(v))
-        out[k] = resolve(val, depth + 1);
+      for (const [k, val] of Object.entries(v)) out[k] = resolve(val, depth + 1);
       return out;
     }
     return v;
   }
 
-  // The top-level array is a pair list [keyToken, valueToken, keyToken, valueToken, ...]
-  // Reconstruct into an object.
-  const result = {};
+  // ---- 3. Flatten the top-level pair list ----
+  // The top-level is [keyTokenOrRef, valueTokenOrRef, ...].
+  // Keys are usually strings ("id", "subject", …) or ref objects {"_N": v} whose
+  // value is a string. Resolve each key and only keep string keys.
+  const flat = {};
   for (let i = 0; i < arr.length; i += 2) {
-    const key = resolve(arr[i]);
+    let key = resolve(arr[i]);
+    // Refs like {"_N": v} resolve to *string* keys when v is a string token
+    // already in refs. If the resolve returned an object, skip.
     if (typeof key !== 'string') continue;
-    result[key] = resolve(arr[i + 1]);
+    flat[key] = resolve(arr[i + 1]);
   }
-  return result;
+
+  // ---- 4. Extract just the fields the client needs ----
+  // The `flat` output includes routing noise: "routes/mail.$id", "data", "email".
+  // The actual message object lives under `flat.email` in this payload, but we
+  // defensively fall back to `flat` itself if that shape changes.
+  const email =
+    (flat.email && typeof flat.email === 'object' && !Array.isArray(flat.email))
+      ? flat.email
+      : flat;
+
+  const pick = [
+    'id',
+    'mailboxId',
+    'messageId',
+    'fromAddress',
+    'toAddress',
+    'subject',
+    'textContent',
+    'htmlContent',
+    'rawEmail',
+    'receivedAt',
+    'isRead',
+    'size',
+    'attachments',
+  ];
+
+  const out = {};
+  for (const k of pick) if (email[k] !== undefined) out[k] = email[k];
+
+  // Normalize: strip trailing whitespace-only HTML, ensure attachments is [].
+  if (typeof out.htmlContent === 'string') {
+    out.htmlContent = out.htmlContent.trim();
+  }
+  if (!out.attachments) out.attachments = [];
+
+  return out;
 }
 
 // ---------- routes ----------
@@ -263,8 +307,8 @@ app.get('/api/mail/:id', async (req, res) => {
         .json({ error: 'Upstream sent non-JSON', body: text.slice(0, 300) });
     }
 
-    //const decoded = decodeKmailPayload(raw);
-    return res.json(raw);
+    const decoded = decodeKmailPayload(raw);
+    return res.json(decoded);
   } catch (err) {
     if (err.name === 'AbortError')
       return res.status(504).json({ error: 'Upstream timed out' });
