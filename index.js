@@ -263,8 +263,8 @@ app.get('/api/mail/:id', async (req, res) => {
         .json({ error: 'Upstream sent non-JSON', body: text.slice(0, 300) });
     }
 
-    const decoded = decodeKmailPayload(raw);
-    return res.json(decoded);
+    //const decoded = decodeKmailPayload(raw);
+    return res.json(raw);
   } catch (err) {
     if (err.name === 'AbortError')
       return res.status(504).json({ error: 'Upstream timed out' });
